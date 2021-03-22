@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -16,9 +18,10 @@ const (
 )
 
 type httpClient struct {
-	counter int64
-	errChan chan error
-	client  http.Client
+	counter        int64
+	errChan        chan error
+	timeoutErrChan chan error
+	client         http.Client
 }
 
 func NewHttpClient() *httpClient {
@@ -32,11 +35,15 @@ func NewHttpClient() *httpClient {
 		Timeout: 1 * time.Second,
 	}
 
-	return &httpClient{client: client, errChan: make(chan error), counter: 1}
+	return &httpClient{client: client, errChan: make(chan error), timeoutErrChan: make(chan error), counter: 1}
 }
 
 func (h *httpClient) IncCounter() {
 	atomic.AddInt64(&h.counter, 1)
+}
+
+func (h *httpClient) Counter() int64 {
+	return h.counter
 }
 
 func (h *httpClient) Get(wg *sync.WaitGroup, addressURL string, requestID int) {
@@ -52,7 +59,8 @@ func (h *httpClient) Get(wg *sync.WaitGroup, addressURL string, requestID int) {
 		if urlErr, ok := err.(*url.Error); ok {
 			if urlErr.Timeout() {
 				log.Printf("Timeout error: %v", urlErr.Error())
-				// return
+				h.timeoutErrChan <- urlErr
+				return
 			}
 		}
 		h.errChan <- err
@@ -60,9 +68,11 @@ func (h *httpClient) Get(wg *sync.WaitGroup, addressURL string, requestID int) {
 	}
 
 	if res.StatusCode != 200 {
-		log.Printf("response ERRPR: %v, rquestID: %v", res.StatusCode, requestID)
+		h.errChan <- errors.New(fmt.Sprintf("Error status code: %v", res.StatusCode))
+		return
+		// log.Printf("response ERRPR: %v, rquestID: %v", res.StatusCode, requestID)
 	}
-	log.Printf("response: %v, rquestID: %v", res.StatusCode, requestID)
+	// log.Printf("response: %v, rquestID: %v", res.StatusCode, requestID)
 }
 
 func (h *httpClient) SpamURL(url string) {
@@ -77,16 +87,21 @@ func (h *httpClient) SpamURL(url string) {
 }
 
 func (h *httpClient) CheckURL(ctx context.Context, url string) error {
+	go func() {
+		for {
+			h.SpamURL(url)
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case err := <-h.errChan:
-			log.Printf("recieve err chan: %v", err)
+			log.Printf("recieve ERROR chan: %v, counter: %v", err, h.Counter())
 			return err
-		default:
-			log.Printf("Counter: %v", h.counter)
-			h.SpamURL(url)
+		case err := <-h.timeoutErrChan:
+			log.Printf("recieve TIMEOUT ERROR chan: %v, counter: %v", err, h.Counter())
+			return err
 		}
 	}
 }
