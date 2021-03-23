@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -52,12 +51,12 @@ func NewHttpClient(logger zerolog.Logger) *httpClient {
 
 // incCounter increment concurrent requests number
 func (h *httpClient) incCounter() {
-	atomic.AddInt64(&h.counter, 1)
+	h.counter++
 }
 
 // GetCounter return current counter value
 func (h *httpClient) GetCounter() int64 {
-	return atomic.LoadInt64(&h.counter)
+	return h.counter
 }
 
 // get makes GET request for given url and writes timeoutErrChan or errChan depends on error type
