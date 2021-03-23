@@ -1,27 +1,27 @@
 package main
 
 import (
-	"context"
-	"log"
-	"os"
+	"flag"
 
 	"github.com/AleksK1NG/http-client/internal/client"
+	"github.com/AleksK1NG/http-client/pkg/logger"
 )
 
-const (
-	URL = "https://zatey.ru/prazdnik/vozdushnye-shariki/"
-)
+var url string
+
+func init() {
+	flag.StringVar(&url, "url", "https://www.youtube.com/", "url address")
+}
 
 func main() {
-	log.Println("Starting server")
-	httpClient := client.NewHttpClient()
+	flag.Parse()
+	l := logger.NewLogger()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	l.Info().Msg("Starting http client")
+	httpClient := client.NewHttpClient(l)
 
-	err := httpClient.CheckURL(ctx, URL)
+	err := httpClient.Run(url)
 	if err != nil {
-		log.Printf("httpClient couter: %v, error: %v", httpClient.Counter(), err)
-		os.Exit(0)
+		l.Info().Msgf("httpClient concurrent requests number: %v 🤓", httpClient.GetCounter())
 	}
 }

@@ -2,19 +2,21 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 const (
-	timeout = 5 * time.Second
+	clientTimeout             = 3 * time.Second
+	dialContextTimeout        = 5 * time.Second
+	clientTLSHandshakeTimeout = 5 * time.Second
 )
 
 type httpClient struct {
@@ -22,33 +24,47 @@ type httpClient struct {
 	errChan        chan error
 	timeoutErrChan chan error
 	client         http.Client
+	wg             *sync.WaitGroup
+	logger         zerolog.Logger
 }
 
-func NewHttpClient() *httpClient {
+// NewHttpClient constructor
+func NewHttpClient(logger zerolog.Logger) *httpClient {
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: (&net.Dialer{
-				Timeout: timeout,
+				Timeout: dialContextTimeout,
 			}).DialContext,
-			TLSHandshakeTimeout: timeout,
+			TLSHandshakeTimeout: clientTLSHandshakeTimeout,
 		},
-		Timeout: 1 * time.Second,
+		Timeout: clientTimeout,
 	}
 
-	return &httpClient{client: client, errChan: make(chan error), timeoutErrChan: make(chan error), counter: 1}
+	return &httpClient{
+		client:         client,
+		errChan:        make(chan error),
+		timeoutErrChan: make(chan error),
+		counter:        1,
+		wg:             &sync.WaitGroup{},
+		logger:         logger,
+	}
 }
 
-func (h *httpClient) IncCounter() {
+// incCounter increment concurrent requests number
+func (h *httpClient) incCounter() {
 	atomic.AddInt64(&h.counter, 1)
 }
 
-func (h *httpClient) Counter() int64 {
-	return h.counter
+// GetCounter return current counter value
+func (h *httpClient) GetCounter() int64 {
+	return atomic.LoadInt64(&h.counter)
 }
 
-func (h *httpClient) Get(wg *sync.WaitGroup, addressURL string, requestID int) {
-	defer wg.Done()
-	req, err := http.NewRequest(http.MethodGet, addressURL, nil)
+// get makes GET request for given url and writes timeoutErrChan or errChan depends on error type
+func (h *httpClient) get(ctx context.Context, addressURL string) {
+	defer h.wg.Done()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, addressURL, nil)
 	if err != nil {
 		h.errChan <- err
 		return
@@ -58,49 +74,54 @@ func (h *httpClient) Get(wg *sync.WaitGroup, addressURL string, requestID int) {
 	if err != nil {
 		if urlErr, ok := err.(*url.Error); ok {
 			if urlErr.Timeout() {
-				log.Printf("Timeout error: %v", urlErr.Error())
-				h.timeoutErrChan <- urlErr
+				h.timeoutErrChan <- urlErr.Err
 				return
 			}
 		}
 		h.errChan <- err
 		return
 	}
+	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		h.errChan <- errors.New(fmt.Sprintf("Error status code: %v", res.StatusCode))
+		h.errChan <- fmt.Errorf("error status code: %v", res.StatusCode)
 		return
-		// log.Printf("response ERRPR: %v, rquestID: %v", res.StatusCode, requestID)
 	}
-	// log.Printf("response: %v, rquestID: %v", res.StatusCode, requestID)
 }
 
-func (h *httpClient) SpamURL(url string) {
-	wg := &sync.WaitGroup{}
-	for i := 0; i < int(h.counter); i++ {
-		wg.Add(1)
-		go h.Get(wg, url, i)
-	}
-	wg.Wait()
-
-	h.IncCounter()
-}
-
-func (h *httpClient) CheckURL(ctx context.Context, url string) error {
-	go func() {
-		for {
-			h.SpamURL(url)
-		}
-	}()
+// spamURL concurrent spam requests for given url
+func (h *httpClient) spamURL(ctx context.Context, url string) {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return
+		default:
+			h.logger.Info().Msgf("sending %v concurrent requests 💫", h.GetCounter())
+
+			for i := 0; i < int(h.GetCounter()); i++ {
+				h.wg.Add(1)
+				go h.get(ctx, url)
+			}
+			h.wg.Wait()
+			h.incCounter()
+		}
+	}
+}
+
+// Run start http client
+func (h *httpClient) Run(url string) error {
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	defer cancelFunc()
+
+	go h.spamURL(ctx, url)
+
+	for {
+		select {
 		case err := <-h.errChan:
-			log.Printf("recieve ERROR chan: %v, counter: %v", err, h.Counter())
-			return err
+			h.logger.Error().Caller().Stack().Msgf("received error: %v 👀", err)
+			// return err 👀
 		case err := <-h.timeoutErrChan:
-			log.Printf("recieve TIMEOUT ERROR chan: %v, counter: %v", err, h.Counter())
+			h.logger.Error().Caller().Stack().Msgf("received timeout error: %v 👀", err)
 			return err
 		}
 	}
