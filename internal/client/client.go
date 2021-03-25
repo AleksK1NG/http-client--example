@@ -7,15 +7,19 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
 	clientTimeout             = 3 * time.Second
 	dialContextTimeout        = 5 * time.Second
 	clientTLSHandshakeTimeout = 5 * time.Second
+	defaultMaxIdleConnections = 5
+	defaultResponseTimeout    = 5 * time.Second
 )
 
 type httpClient struct {
@@ -31,6 +35,8 @@ type httpClient struct {
 func NewHttpClient(logger zerolog.Logger) *httpClient {
 	client := http.Client{
 		Transport: &http.Transport{
+			MaxIdleConnsPerHost:   defaultMaxIdleConnections,
+			ResponseHeaderTimeout: defaultResponseTimeout,
 			DialContext: (&net.Dialer{
 				Timeout: dialContextTimeout,
 			}).DialContext,
@@ -51,22 +57,22 @@ func NewHttpClient(logger zerolog.Logger) *httpClient {
 
 // incCounter increment concurrent requests number
 func (h *httpClient) incCounter() {
-	h.counter++
+	atomic.AddInt64(&h.counter, 1)
 }
 
 // GetCounter return current counter value
 func (h *httpClient) GetCounter() int64 {
-	return h.counter
+	return atomic.LoadInt64(&h.counter)
 }
 
 // get makes GET request for given url and writes timeoutErrChan or errChan depends on error type
-func (h *httpClient) get(ctx context.Context, addressURL string) {
+func (h *httpClient) get(ctx context.Context, addressURL string) error {
 	defer h.wg.Done()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, addressURL, nil)
 	if err != nil {
 		h.errChan <- err
-		return
+		return nil
 	}
 
 	res, err := h.client.Do(req)
@@ -74,22 +80,26 @@ func (h *httpClient) get(ctx context.Context, addressURL string) {
 		if urlErr, ok := err.(*url.Error); ok {
 			if urlErr.Timeout() {
 				h.timeoutErrChan <- urlErr.Err
-				return
+				return err
 			}
 		}
 		h.errChan <- err
-		return
+		return nil
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		h.errChan <- fmt.Errorf("error status code: %v", res.StatusCode)
-		return
+		resErr := fmt.Errorf("error status code: %v", res.StatusCode)
+		h.errChan <- resErr
+		return nil
 	}
+	return nil
 }
 
 // spamURL concurrent spam requests for given url
 func (h *httpClient) spamURL(ctx context.Context, url string) {
+	errGroup, ctx := errgroup.WithContext(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -99,7 +109,9 @@ func (h *httpClient) spamURL(ctx context.Context, url string) {
 
 			for i := 0; i < int(h.GetCounter()); i++ {
 				h.wg.Add(1)
-				go h.get(ctx, url)
+				errGroup.Go(func() error {
+					return h.get(ctx, url)
+				})
 			}
 			h.wg.Wait()
 			h.incCounter()
